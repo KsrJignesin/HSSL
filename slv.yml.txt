@@ -1,0 +1,31 @@
+needs_auth: false
+
+endpoints:
+  generate_device_code: 'https://apiv2.sonyliv.com/AGL/3.8/A/ENG/FIRE_TV/IN/{state_code}/GENERATEDEVICEACTIVATIONCODE'
+  verify_code: 'https://apiv2.sonyliv.com/AGL/3.8/A/ENG/FIRE_TV/IN/{state_code}/GENERATEDEVICEACTIVATIONCODE'
+  activate_url: 'https://www.sonyliv.com/device/activate'
+  get_contact_id: 'https://apiv2.sonyliv.com/AGL/3.8/SR/ENG/FIRE_TV/IN/{state_code}/GETPROFILE?channelPartnerID={channelpartnerid}'
+  uld_url: 'https://bootstrap-prod.sonyliv.com/AGL/1.0/FIRE_TV/ULD'
+  detail_url: 'https://apiv3.sonyliv.com/AGL/4.8/SR/ENG/FIRE_TV/IN/{state_code}/DETAIL-V3/{media_id}'
+  action_url: 'https://apiv3.sonyliv.com/AGL/4.8/SR/ENG/FIRE_TV/IN/{state_code}'
+  bundle_url: 'https://apiv3.sonyliv.com/AGL/4.8/SR/ENG/FIRE_TV/IN/{state_code}/CONTENT/DETAIL/BUNDLE/{media_id}'
+  mpd_url: 'https://apiv2.sonyliv.com/AGL/5.0/SR/ENG/FIRE_TV/IN/{state_code}/CONTENT/VIDEOURL/VOD/{media_id}?contactId={contact_id}&kids_safe=false'
+
+device:
+  app_version: '6.23.5'
+  build_number: '10912'
+  user_agent: 'com.sonyliv/6.23.5 (Android 12; en_IN; AFTMM; Build/NS6281 )'
+  brand: 'Amazon'
+  device_model: 'AFTMM'
+  model_number: 'AmazonAFTMM'
+  device_name: 'Fire TV Sony Liv'
+  device_type: 'FireTV'
+  os_version: '12'
+  device_res: '2160'
+  supp_codec: 'HEVC,AAC,EAC3,AC3,ATMOS'
+  audio_decoder: 'EAC3,AAC,AC3,ATMOS'
+  ram: '2'
+  device_type: 'tv'
+  conn_type: 'WIFI'
+  client_throughput: '1611'
+  td_user_agent: 'com.sonyliv\/6.23.5 (Android 12; en_IN; AFTMM; Build\/NS6281 )'

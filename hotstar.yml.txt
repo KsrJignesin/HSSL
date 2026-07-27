@@ -1,0 +1,16 @@
+needs_auth: false
+
+endpoints:
+  # BFF API (works with proxy)
+  # tv_title_bff: 'https://www.hotstar.com/api/internal/bff/v2/slugs/{id}'
+  # tv_episodes_bff: 'https://www.hotstar.com/api/internal/bff/'
+  # Old API (fallback)
+  base_url: https://apix.hotstar.com
+  movie_title: 'https://apix.hotstar.com/v2/pages/detail'
+  location_url: https://usersvc.hotstar.com/v1/location
+  fresh_start: https://apix.hotstar.com/v2/freshstart
+  start_url: https://apix.hotstar.com/v2/start
+  # tv_title: 'https://api.hotstar.com/o/v1/show/detail'
+  # tv_episodes: 'https://api.hotstar.com/o/v1/tray/g/1/detail'
+  watch: 'https://apix.hotstar.com/v2/pages/watch'
+  # refresh: 'https://api.hotstar.com/um/v3/users/refresh'
