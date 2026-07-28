@@ -1,0 +1,9 @@
+# Hotstar (Disney+ Hotstar) Service Configuration
+
+endpoints:
+  base_url: https://apix.hotstar.com
+  movie_title: 'https://apix.hotstar.com/v2/pages/detail'
+  location_url: https://usersvc.hotstar.com/v1/location
+  fresh_start: https://apix.hotstar.com/v2/freshstart
+  start_url: https://apix.hotstar.com/v2/start
+  watch: 'https://apix.hotstar.com/v2/pages/watch'
