@@ -1,941 +1,1043 @@
+import base64
 import json
 import os
+import queue
+import random
 import re
-import uuid
-import requests
-import click
-import m3u8
+import secrets
+import threading
 import time
 import uuid
-import hashlib
-from hashlib import md5
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from pathlib import Path
 
+import click
+import m3u8
+import requests
+
+from vinetrimmer.config import config, directories
 from vinetrimmer.objects import TextTrack, Title, Tracks
 from vinetrimmer.services.BaseService import BaseService
-
-# ANSI Color codes for enhanced logging
-class Colors:
-    CYAN = '\033[96m'
-    YELLOW = '\033[93m'
-    GREEN = '\033[92m'
-    RESET = '\033[0m'
+from vinetrimmer.utils.pypr import PSSH, Cdm, Device, PlayReadyHeaderBuilder
+from vinetrimmer.utils.widevine.device import LocalDevice
 
 
-class SonyLiv(BaseService):
+class Sonyliv(BaseService):
+    """
+    SonyLiv India streaming service (https://sonyliv.com).
+    \b
+    Authorization: OTP + Android TV device activation
+    Security: UHD@L3
 
-    ALIASES = ["SONY", "SonyLiv"]
-    #GEOFENCE = ["hs"]
+    Script By Hugov, https://telegram.me/divine_404, mhm
+    """
+
+    ALIASES = ["SL", "sonyliv"]
+
+    TITLE_RE = r"^(?:https?://(?:www\.)?sonyliv.com/(?P<type>movies|shows)/[a-z0-9-]+-)?(?P<id>\d+)"
 
     @staticmethod
-    @click.command(name="SonyLiv", short_help="https://sonyliv.com")
+    @click.command(name="Sonyliv", short_help="https://sonyliv.com")
     @click.argument("title", type=str, required=False)
     @click.pass_context
     def cli(ctx, **kwargs):
-        return SonyLiv(ctx, **kwargs)
-
+        return Sonyliv(ctx, **kwargs)
 
     def __init__(self, ctx, title):
         super().__init__(ctx)
-        title = title.replace("?watch=true", "")
-        #self.log.info(title)
-        self.title = title.split("-")[-1]
-        parts = title.split("/")
-        for part in reversed(parts):
-            if part.isdigit():
-                self.title = part
-            else:
-                sub_parts = part.split("-")
-                for sub_part in reversed(sub_parts):
-                    if sub_part.isdigit():
-                        self.title = sub_part
-        #self.log.info(self.title)
+        self.m = self.parse_title(ctx, title)
 
-        assert ctx.parent is not None
-
-        self.vcodec = ctx.parent.params["vcodec"]
-        self.quality = ctx.parent.params["quality"]
+        self.vcodec = ctx.parent.params["vcodec"] or "H264"
         self.acodec = ctx.parent.params["acodec"] or "EC3"
-        self.range = ctx.parent.params["range_"]
-        self.hdrdv = ctx.parent.params["hdrdv"]
+        self.range = ctx.parent.params["range_"] or "SDR"
+        self.quality = ctx.parent.params.get("quality") or 1080
+        self.playready = ctx.obj.cdm.device.type == LocalDevice.Types.PLAYREADY
 
         self.profile = ctx.obj.profile
 
+        android_cfg = self.config.get("device", {}).get("android", {})
+        web_cfg = self.config.get("device", {}).get("web", {})
+
+        self.android_user_agent = android_cfg.get(
+            "user_agent",
+            "com.onemainstream.sonyliv.android/8.95 (Android 7.1.2; en_IN; AFTMM; Build/NS6281 )",
+        )
+        self.android_build_number = android_cfg.get("build_number", "10491")
+        self.android_app_version = android_cfg.get("app_version", "6.12.35")
+
+        self.web_user_agent = web_cfg.get(
+            "user_agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0",
+        )
+        self.web_accept_language = web_cfg.get("accept_language", "en-US,en;q=0.9")
+        self.web_sec_ch_ua = web_cfg.get(
+            "sec_ch_ua",
+            '"Microsoft Edge";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+        )
+
         self.device_id = None
-        self.token = None
+        self.session_id = None
+        self.security_token = None
+        self.accessToken = None
+        self.profile_id = None
         self.license_api = None
 
         self.configure()
 
-
-    def get_titles(self):
-        r = self.session.get(
-            url=self.config["endpoints"]["detail_url"].format(state_code=self.state_code, media_id=self.title),
-            params={
-                "kids_safe": "false",
-                "from": "0",
-                "to": "0",
-                "segment_id": "AB_Free_Text_Tray_No_Tag,AB_New_Trays,AB_New_Trays_Home_Page,AB_TKMOC_Tray,AB_DetailPage_Disable",
-                "revamp": "true",
-                "onlymeta": "true",
-            },
-            headers = {
-                "Accept-Encoding": "gzip",
-                "app_version": self.config["device"]["app_version"],
-                "build_number": self.config["device"]["build_number"],
-                "Connection": "Keep-Alive",
-                "Content-Type": "application/json",
-                "device_id": self.device_id,
-                "session_id": self.session_id,
-                "user-agent": self.config["device"]["user_agent"],
-                "x-via-device": "true",
-            }
-        try:
-            res = r.json()['resultObj']['containers'][0]
-            #self.log.info(res)
-        except json.JSONDecodeError:
-            print(r.status_code)
-            raise ValueError(f"Failed to load title manifest: {r.text}")
-        if res['metadata']['contentSubtype'] == 'MOVIE' or res['metadata']['contentSubtype'] == 'MOVIE_BUNDLE':
-            # Extract duration from metadata if available
-            duration = (res['metadata'].get('duration') or 
-                       res['metadata'].get('runtime') or 
-                       res['metadata'].get('length') or
-                       res['metadata'].get('totalDuration') or
-                       res['metadata'].get('runTime') or
-                       res['metadata'].get('durationInSeconds') or
-                       res['metadata'].get('durationInMinutes'))
-            if duration:
-                # Convert to seconds if needed (assuming it might be in minutes or already in seconds)
-                if isinstance(duration, str) and ':' in duration:
-                    # Format like "HH:MM:SS" or "MM:SS"
-                    time_parts = duration.split(':')
-                    if len(time_parts) == 3:
-                        duration = int(time_parts[0]) * 3600 + int(time_parts[1]) * 60 + int(time_parts[2])
-                    elif len(time_parts) == 2:
-                        duration = int(time_parts[0]) * 60 + int(time_parts[1])
-                elif isinstance(duration, (int, float)):
-                    # Check if this is from durationInMinutes field
-                    if 'durationInMinutes' in res['metadata'] and res['metadata']['durationInMinutes'] == duration:
-                        duration = int(duration * 60)  # Convert minutes to seconds
-                    elif duration < 1000:  # Likely in minutes if less than 1000
-                        duration = int(duration * 60)
-                    else:
-                        duration = int(duration)
-                else:
-                    duration = None
-            if res["layout"] == "BUNDLE_ITEM":
-                action_url = self.config["endpoints"]["action_url"].format(state_code=self.state_code) + res["actions"][0]["uri"]
-                res2 = self.session.get(action_url).json()
-                for i in res2["resultObj"]["containers"][0]["containers"]:
-                    if i["metadata"]["objectSubtype"] == "MOVIE":
-                        ids = i["metadata"]["contentId"]
-            else:
-                ids = res['metadata']['contentId']
-            return Title(
-                id_=ids,
-                type_=Title.Types.MOVIE,
-                name=re.sub(r'\([^)]*\)', '', res['metadata']["title"]),
-                year=res['metadata']["year"],
-                original_lang=res['metadata']["language"],
-                source=self.ALIASES[0],
-                service_data=res,
-                duration=duration,
-            )
-        else:
-            season_data = []
-            info_dict = {}
-            if res['metadata']['contentSubtype'] == "EPISODIC_SHOW":
-                r = self.session.get(
-                    url=self.config["endpoints"]["bundle_url"].format(state_code=self.state_code, media_id=res["id"]),
-                    headers = {
-                        "Accept-Encoding": "gzip",
-                        "app_version": self.config["device"]["app_version"],
-                        "Authorization": self.token  # Paste the full JWT here
-                        "build_number": self.config["device"]["build_number"],
-                        "Content-Type": "application/json",
-                        "device_id": self.device_id,
-                        "session_id": self.session_id,
-                        "User-Agent": self.config["device"]["user_agent"],
-                        "x-via-device": "true",
-                    },
-                    params={
-                        "fromSeq": "0",
-                        "toSeq": "1000",
-                        "orderBy": "episode_series_sequence",
-                        "sortOrder": "asc",
-                        "kids_safe": "false",
-                    },
-                ).json()
-                #self.log.info(r)
-
-                for y in r['resultObj']['containers'][0]['containers']:
-                    # Extract duration from episode metadata if available
-                    duration = (y['metadata'].get('duration') or 
-                               y['metadata'].get('runtime') or 
-                               y['metadata'].get('length') or
-                               y['metadata'].get('totalDuration') or
-                               y['metadata'].get('runTime') or
-                               y['metadata'].get('durationInSeconds') or
-                               y['metadata'].get('durationInMinutes'))
-                    if duration:
-                        # Convert to seconds if needed
-                        if isinstance(duration, str) and ':' in duration:
-                            time_parts = duration.split(':')
-                            if len(time_parts) == 3:
-                                duration = int(time_parts[0]) * 3600 + int(time_parts[1]) * 60 + int(time_parts[2])
-                            elif len(time_parts) == 2:
-                                duration = int(time_parts[0]) * 60 + int(time_parts[1])
-                        elif isinstance(duration, (int, float)):
-                            # Check if this is from durationInMinutes field
-                            if 'durationInMinutes' in y['metadata'] and y['metadata']['durationInMinutes'] == duration:
-                                duration = int(duration * 60)  # Convert minutes to seconds
-                            elif duration < 1000:  # Likely in minutes
-                                duration = int(duration * 60)
-                            else:
-                                duration = int(duration)
-                        else:
-                            duration = None
-                    
-                    info_dict = {
-                        'id': y['metadata']['contentId'],
-                        'name': res['metadata']["title"],
-                        #'year': y['metadata']['year'],
-                        'season': res['metadata']['season'],
-                        'episode': y['metadata']['episodeNumber'],
-                        'episodename': y['metadata']['episodeTitle'],
-                        'originallang': y['metadata']['language'],
-                        'servicedata': y,
-                        'duration': duration,
-                    }
-                    season_data.append(info_dict)
-            else:
-                for x in res['containers']:
-
-                    r = self.session.get(
-                        url=self.config["endpoints"]["bundle_url"].format(state_code=self.state_code, media_id=x["id"]),
-                        headers = {
-                            "Accept-Encoding": "gzip",
-                            "app_version": self.config["device"]["app_version"],
-                            "Authorization": self.token  # Paste the full JWT here
-                            "build_number": self.config["device"]["build_number"],
-                            "Content-Type": "application/json",
-                            "device_id": self.device_id,
-                            "session_id": self.session_id,
-                            "User-Agent": self.config["device"]["user_agent"],
-                            "x-via-device": "true",
-                        },
-                        params={
-                            "from": "0",
-                            "to": "1000",
-                            "orderBy": "episodeNumber",
-                            "sortOrder": "asc",
-                            "kids_safe": "false",
-                        },
-                    ).json()
-                    #self.log.info(r)
-
-                    for y in r['resultObj']['containers'][0]['containers']:
-                        # Extract duration from episode metadata if available
-                        duration = (y['metadata'].get('duration') or 
-                                   y['metadata'].get('runtime') or 
-                                   y['metadata'].get('length') or
-                                   y['metadata'].get('totalDuration') or
-                                   y['metadata'].get('runTime') or
-                                   y['metadata'].get('durationInSeconds') or
-                                   y['metadata'].get('durationInMinutes'))
-                        if duration:
-                            # Convert to seconds if needed
-                            if isinstance(duration, str) and ':' in duration:
-                                time_parts = duration.split(':')
-                                if len(time_parts) == 3:
-                                    duration = int(time_parts[0]) * 3600 + int(time_parts[1]) * 60 + int(time_parts[2])
-                                elif len(time_parts) == 2:
-                                    duration = int(time_parts[0]) * 60 + int(time_parts[1])
-                            elif isinstance(duration, (int, float)):
-                                # Check if this is from durationInMinutes field
-                                if 'durationInMinutes' in y['metadata'] and y['metadata']['durationInMinutes'] == duration:
-                                    duration = int(duration * 60)  # Convert minutes to seconds
-                                elif duration < 1000:  # Likely in minutes
-                                    duration = int(duration * 60)
-                                else:
-                                    duration = int(duration)
-                            else:
-                                duration = None
-                        
-                        info_dict = {
-                            'id': y['metadata']['contentId'],
-                            'name': res['metadata']["title"],
-                            #'year': y['metadata']['year'],
-                            'season': x['metadata']['season'],
-                            'episode': y['metadata']['episodeNumber'],
-                            'episodename': y['metadata']['episodeTitle'],
-                            'originallang': y['metadata']['language'],
-                            'servicedata': y,
-                            'duration': duration,
-                        }
-                        season_data.append(info_dict)
-
-            return [Title(
-                id_=x["id"],
-                type_=Title.Types.TV,
-                name=re.sub(r'\([^)]*\)', '', x["name"]),
-                #year=x["year"],
-                season=x["season"],
-                episode=x["episode"],
-                episode_name=re.sub(r'\([^)]*\)', '', x["episodename"]),
-                original_lang=x["originallang"],
-                source=self.ALIASES[0],
-                service_data=x['servicedata'],
-                duration=x.get('duration'),
-            ) for x in season_data]
-    
-    #
-    def get_lisence(self, id):
-        res = self.session.post(
-            url=f'https://apiv2.sonyliv.com/AGL/2.4/SR/ENG/FIRE_TV/IN/{self.state_code}/CONTENT/GETLAURL',
-            headers={
-                "Accept-Encoding": "gzip",
-                "Content-Type": "application/json",
-                "x-via-device": "true",
-                "Host": "apiv2.sonyliv.com",
-                "Authorization": self.token,
-                "session-id": self.session_id,
-                "user-agent": self.config["device"]["user_agent"],
-                "build_number": self.config["device"]["build_number"],
-                "app_version": self.config["device"]["app_version"],
-                "device_id": self.device_id,
-            },
-            json={
-                "actionType": "play",
-                "assetId": id,
-                "browser": "chrome",
-                "deviceId": self.device_id,
-                "os": "android",
-                "platform": "web"
-            }
-        ).json()
-        return res['resultObj']['laURL']
-
-
-    def get_manifest(self, id, client):
-        r = self.session.post(
-            url=self.config["endpoints"]["mpd_url"].format(state_code=self.state_code, media_id=id, contact_id=self.contact_id),
-            headers = {
-                "Accept-Encoding": "gzip",
-                "app_version": self.config["device"]["app_version"],
-                "Authorization": self.token,  # Paste your full JWT here
-                "build_number": self.config["device"]["build_number"],
-                "Content-Type": "application/json",
-                "device_id": self.device_id,
-                "session_id": self.session_id,
-                "td_client_hints": (
-                    '{"os_name":"Android",'
-                    '"os_version":"12",'
-                    '"device_make":"unknown",'
-                    '"device_model":"AOSP TV on x86",'
-                    '"display_res":"4080",'
-                    '"viewport_res":"4080",'
-                    '"supp_codec":"AAC,H264,HEVC",'
-                    '"audio_decoder":"AAC",'
-                    '"hdr_decoder":"NONE",'
-                    '"app_version":"6.23.5",'
-                    '"td_user_useragent":"com.sonyliv\\/6.23.5 (Android 12; en_XC; AOSP TV on x86; Build\\/STT9.221129.002 )",'
-                    '"ram":2,'
-                    '"device_type":"tv",'
-                    '"is_low_end_device":false,'
-                    '"conn_type":"WIFI",'
-                    '"client_throughput":1611}'
-                ),
-                "User-Agent": self.config["device"]["user_agent"],
-                "x-via-device": "true",
-            }
-            headers = {
-                "Accept-Encoding": "gzip",
-                "app_version": "6.19.4",
-                "Authorization": self.token,
-                "build_number": "10886",
-                "Connection": "Keep-Alive",
-                "Content-Type": "application/json",
-                "device_id": self.device_id,
-                "session_id": self.session_id,
-                "User-Agent": "com.sonyliv/6.19.4 (Android 12; en_US; AOSP TV on x86; Build/STT9.221129.002 )",
-                "x-via-device": "true",
-                "td_client_hints": json.dumps(client, separators=(",", ":"))
-            },
-            json = {
-                "actionType": "play",
-                "adsParams": {
-                    "app_ver": "6.19.4",
-                    "gId": hashlib.md5(uuid.uuid4().bytes).hexdigest(),
-                    "Idtype": "adid",
-                    "Is_lat": "0",
-                    "spty": "subscribed",
-                    "vid": str(id)
-                },
-                "browser": "chrome",
-                "deeplinkLang": "",
-                "deviceId": self.device_id,
-                "hasLAURLEnabled": True,
-                "os": "android",
-                "platform": "web"
-            }
-        )
-        print(id)
-        try:
-            return r.json()
-        except json.JSONDecodeError:
-            raise ValueError(f"Failed to load tracks manifest: {r.text}")
-
-    def get_tracks(self, title):
-        # Log duration information if available with enhanced formatting and colors
-        if title.duration:
-            duration_str = title.get_duration_str()
-            content_type = "Movie" if title.type == Title.Types.MOVIE else f"Episode S{title.season:02d}E{title.episode:02d}"
-            # Add colors: cyan for emoji, yellow for content type, green for duration
-            self.log.info(f"{Colors.CYAN}🎥{Colors.RESET} {Colors.YELLOW}{content_type} Duration:{Colors.RESET} {Colors.GREEN}{duration_str}{Colors.RESET}")
-
-        if self.vcodec == 'H265':
-            if self.hdrdv:
-                tracks = Tracks()
-                client = {
-                    '{"os_name":"Android",'
-                    f'"os_version":{self.config["device"]["os_version"]},'
-                    f'"device_make":{self.config["device"]["brand"]},'
-                    f'"device_model":{self.config["device"]["device_model"]},'
-                    f'"display_res":{self.config["device"]["device_res"]},'
-                    f'"viewport_res":{self.config["device"]["device_res"]},'
-                    f'"supp_codec":"HEVC,AAC,EAC3,AC3,ATMOS",'
-                    f'"audio_decoder":{self.config["device"]["audio_decoder"]},'
-                    f'"hdr_decoder":"DOLBY_VISION",'
-                    f'"app_version":{self.config["device"]["app_version"]},'
-                    f'"td_user_useragent":{self.config["device"]["td_user_agent"]},'
-                    f'"ram":{self.config["device"]["ram"]},'
-                    f'"device_type":{self.config["device"]["device_type"]},'
-                    f'"is_low_end_device":false,'
-                    f'"conn_type":{self.config["device"]["conn_type"]},'
-                    f'"client_throughput":{self.config["device"]["client_throughput"]}}'
-                }
-                res = self.get_manifest(title.id, client)
-                dv_url = res["resultObj"]["videoURL"]
-                if res.get("isEncrypted") and (
-                    "LA_Details" not in res or
-                    "laURL" not in res.get("LA_Details", {})
-                ):
-                    self.license_api = self.get_lisence(title.id)
-                else:
-                    self.license_api = res["resultObj"]["LA_Details"]["laURL"]
-                old_headers = self.session.headers
-                
-                host_match = re.search(r'https://([^/]+)', dv_url)
-                host = host_match.group(1) if host_match else None
-
-                self.session.headers = {
-                    #'Host': host,
-                    "User-Agent": "com.onemainstream.sonyliv.android/8.95 (Android 7.1.2; en_IN; AFTMM; Build/NS6281 )",
-                    "x-playback-session-id": self.device_id,
-                }
-                self.log.info(dv_url)
-                if ".m3u8" in dv_url:
-                    dv_tracks = Tracks.from_m3u8(
-                        master=m3u8.load(dv_url),
-                        source=self.ALIASES[0]
-                    )
-                    for track in tracks:
-                        track.extra = mpd_url
-                else:
-                    dv_tracks = Tracks.from_mpd(
-                        url=dv_url,
-                        session=self.session,
-                        source=self.ALIASES[0]
-                    )
-                if self.license_api:
-                    for track in dv_tracks:
-                        track.license_url = self.license_api
-                if res["resultObj"]["subtitle"]:
-                    #self.log.info(res["resultObj"]["subtitle"])
-                    for x in res["resultObj"]["subtitle"]:
-                        sub_url = x["subtitleUrl"]
-                        response = requests.get(sub_url)
-                        if response.status_code == 200:
-                            tracks.add(
-                                TextTrack(
-                                    id_=md5(sub_url.encode()).hexdigest()[0:6],
-                                    source=self.ALIASES[0],
-                                    url=sub_url,
-                                    codec='vtt',
-                                    language=x["subtitleLanguageName"],
-                                    forced=False,
-                                    sdh=False
-                                )
-                            )
-                
-                client = {
-                    '{"os_name":"Android",'
-                    f'"os_version":{self.config["device"]["os_version"]},'
-                    f'"device_make":{self.config["device"]["brand"]},'
-                    f'"device_model":{self.config["device"]["device_model"]},'
-                    f'"display_res":{self.config["device"]["device_res"]},'
-                    f'"viewport_res":{self.config["device"]["device_res"]},'
-                    f'"supp_codec":"HEVC,AAC,EAC3,AC3,ATMOS",'
-                    f'"audio_decoder":{self.config["device"]["audio_decoder"]},'
-                    f'"hdr_decoder":"HDR10",'
-                    f'"app_version":{self.config["device"]["app_version"]},'
-                    f'"td_user_useragent":{self.config["device"]["td_user_agent"]},'
-                    f'"ram":{self.config["device"]["ram"]},'
-                    f'"device_type":{self.config["device"]["device_type"]},'
-                    f'"is_low_end_device":false,'
-                    f'"conn_type":{self.config["device"]["conn_type"]},'
-                    f'"client_throughput":{self.config["device"]["client_throughput"]}}'
-                }
-                self.session.headers = old_headers
-                res = self.get_manifest(title.id, client)
-                hdr_url = res["resultObj"]["videoURL"]
-                if res.get("isEncrypted") and (
-                    "LA_Details" not in res or
-                    "laURL" not in res.get("LA_Details", {})
-                ):
-                    self.license_api = self.get_lisence(title.id)
-                else:
-                    self.license_api = res["resultObj"]["LA_Details"]["laURL"]
-
-                host_match = re.search(r'https://([^/]+)', hdr_url)
-                host = host_match.group(1) if host_match else None
-                self.session.headers = {
-                    #'Host': host,
-                    "User-Agent": "com.onemainstream.sonyliv.android/8.95 (Android 7.1.2; en_IN; AFTMM; Build/NS6281 )",
-                    "x-playback-session-id": self.device_id,
-                }
-                self.log.info(hdr_url)
-                if ".m3u8" in hdr_url:
-                    hdr_tracks = Tracks.from_m3u8(
-                        master=m3u8.load(hdr_url),
-                        source=self.ALIASES[0]
-                    )
-                    for track in tracks:
-                        track.extra = mpd_url
-                else:
-                    hdr_tracks = Tracks.from_mpd(
-                        url=hdr_url,
-                        session=self.session,
-                        source=self.ALIASES[0]
-                    )
-                if self.license_api:
-                    for track in hdr_tracks:
-                        track.license_url = self.license_api
-                if res["resultObj"]["subtitle"]:
-                    #self.log.info(res["resultObj"]["subtitle"])
-                    for x in res["resultObj"]["subtitle"]:
-                        sub_url = x["subtitleUrl"]
-                        response = requests.get(sub_url)
-                        if response.status_code == 200:
-                            tracks.add(
-                                TextTrack(
-                                    id_=md5(sub_url.encode()).hexdigest()[0:6],
-                                    source=self.ALIASES[0],
-                                    url=sub_url,
-                                    codec='vtt',
-                                    language=x["subtitleLanguageName"],
-                                    forced=False,
-                                    sdh=False
-                                )
-                            )
-
-                if self.range == 'HDR10' and "hdr" in hdr_url:
-                    for track in hdr_tracks.videos:
-                        if not track.hdr10:
-                            track.hdr10 = True
-
-                    tracks.add(dv_tracks, warn_only=True)
-                    tracks.add(hdr_tracks, warn_only=True)
-
-                for track in tracks:
-                    track.needs_proxy = True
-                hdr_tracks = [v for v in tracks.videos if getattr(v, "hdr10", False)]
-                dv_tracks  = [v for v in tracks.videos if getattr(v, "dv", False)]
-
-                if hdr_tracks:
-                    best_hdr = sorted(hdr_tracks, key=lambda x: (x.height, x.bitrate), reverse=True)[0]
-                    best_hdr.selected = True
-                    self.log.info(f"Selected HDR base: {best_hdr}")
-
-                if dv_tracks:
-                    best_dv = sorted(dv_tracks, key=lambda x: (x.height, x.bitrate), reverse=True)[0]
-                    best_dv.selected = True
-                    self.log.info(f"Selected DV track: {best_dv}")
-                tracks.range = "HDRDV"
-                return tracks
-
-            else:
-                if self.range == 'DV':
-                    client = {
-                        '{"os_name":"Android",'
-                        f'"os_version":{self.config["device"]["os_version"]},'
-                        f'"device_make":{self.config["device"]["brand"]},'
-                        f'"device_model":{self.config["device"]["device_model"]},'
-                        f'"display_res":{self.config["device"]["device_res"]},'
-                        f'"viewport_res":{self.config["device"]["device_res"]},'
-                        f'"supp_codec":"HEVC,AAC,EAC3,AC3,ATMOS",'
-                        f'"audio_decoder":{self.config["device"]["audio_decoder"]},'
-                        f'"hdr_decoder":"DOLBY_VISION",'
-                        f'"app_version":{self.config["device"]["app_version"]},'
-                        f'"td_user_useragent":{self.config["device"]["td_user_agent"]},'
-                        f'"ram":{self.config["device"]["ram"]},'
-                        f'"device_type":{self.config["device"]["device_type"]},'
-                        f'"is_low_end_device":false,'
-                        f'"conn_type":{self.config["device"]["conn_type"]},'
-                        f'"client_throughput":{self.config["device"]["client_throughput"]}}'
-                    }
-                elif self.range == 'HDR10':
-                    client = {
-                        '{"os_name":"Android",'
-                        f'"os_version":{self.config["device"]["os_version"]},'
-                        f'"device_make":{self.config["device"]["brand"]},'
-                        f'"device_model":{self.config["device"]["device_model"]},'
-                        f'"display_res":{self.config["device"]["device_res"]},'
-                        f'"viewport_res":{self.config["device"]["device_res"]},'
-                        f'"supp_codec":"HEVC,AAC,EAC3,AC3,ATMOS",'
-                        f'"audio_decoder":{self.config["device"]["audio_decoder"]},'
-                        f'"hdr_decoder":"HDR10",'
-                        f'"app_version":{self.config["device"]["app_version"]},'
-                        f'"td_user_useragent":{self.config["device"]["td_user_agent"]},'
-                        f'"ram":{self.config["device"]["ram"]},'
-                        f'"device_type":{self.config["device"]["device_type"]},'
-                        f'"is_low_end_device":false,'
-                        f'"conn_type":{self.config["device"]["conn_type"]},'
-                        f'"client_throughput":{self.config["device"]["client_throughput"]}}'
-                    }
-                elif self.range == 'SDR':
-                    client = {
-                        '{"os_name":"Android",'
-                        f'"os_version":{self.config["device"]["os_version"]},'
-                        f'"device_make":{self.config["device"]["brand"]},'
-                        f'"device_model":{self.config["device"]["device_model"]},'
-                        f'"display_res":{self.config["device"]["device_res"]},'
-                        f'"viewport_res":{self.config["device"]["device_res"]},'
-                        f'"supp_codec":"HEVC,AAC,EAC3,AC3,ATMOS",'
-                        f'"audio_decoder":{self.config["device"]["audio_decoder"]},'
-                        f'"hdr_decoder":"HLG",'
-                        f'"app_version":{self.config["device"]["app_version"]},'
-                        f'"td_user_useragent":{self.config["device"]["td_user_agent"]},'
-                        f'"ram":{self.config["device"]["ram"]},'
-                        f'"device_type":{self.config["device"]["device_type"]},'
-                        f'"is_low_end_device":false,'
-                        f'"conn_type":{self.config["device"]["conn_type"]},'
-                        f'"client_throughput":{self.config["device"]["client_throughput"]}}'
-                    }
-        else:
-            client = {
-                '{"os_name":"Android",'
-                f'"os_version":{self.config["device"]["os_version"]},'
-                f'"device_make":{self.config["device"]["brand"]},'
-                f'"device_model":{self.config["device"]["device_model"]},'
-                f'"display_res":{self.config["device"]["device_res"]},'
-                f'"viewport_res":{self.config["device"]["device_res"]},'
-                f'"supp_codec":"H264,AV1,AAC,AC3,EAC3",'
-                f'"audio_decoder":{self.config["device"]["audio_decoder"]},'
-                f'"hdr_decoder":"UNKNOWN",'
-                f'"app_version":{self.config["device"]["app_version"]},'
-                f'"td_user_useragent":{self.config["device"]["td_user_agent"]},'
-                f'"ram":{self.config["device"]["ram"]},'
-                f'"device_type":{self.config["device"]["device_type"]},'
-                f'"is_low_end_device":false,'
-                f'"conn_type":{self.config["device"]["conn_type"]},'
-                f'"client_throughput":{self.config["device"]["client_throughput"]}}'
-            }
-        res = self.get_manifest(title.id, client)
-
-        mpd_url = res["resultObj"]["videoURL"]
-        self.log.info(mpd_url)
-        
-        if res.get("isEncrypted") and (
-            "LA_Details" not in res or
-            "laURL" not in res.get("LA_Details", {})
-        ):
-            self.license_api = self.get_lisence(title.id)
-        else:
-            self.license_api = res["resultObj"]["LA_Details"]["laURL"]
-
-        host_match = re.search(r'https://([^/]+)', mpd_url)
-        host = host_match.group(1) if host_match else None
-
-        self.session.headers = {
-            #'Host': host,
-            "User-Agent": "com.onemainstream.sonyliv.android/8.95 (Android 7.1.2; en_IN; AFTMM; Build/NS6281 )",
-            "x-playback-session-id": self.device_id,
+    def _android_headers(self):
+        return {
+            "Content-Type": "application/json",
+            "x-via-device": "true",
+            "Host": "apiv2.sonyliv.com",
+            "Authorization": self.accessToken,
+            "session-id": self.session_id,
+            "user-agent": self.android_user_agent,
+            "build_number": self.android_build_number,
+            "app_version": self.android_app_version,
+            "security_token": self.security_token,
+            "device_id": self.device_id,
         }
 
-        if ".m3u8" in mpd_url:
-            tracks = Tracks.from_m3u8(
-                master=m3u8.load(mpd_url),
-                source=self.ALIASES[0]
+    def get_titles(self):
+        headers = self._android_headers()
+
+        r = requests.get(
+            url=self.config["endpoints"]["title"].format(id=self.m["id"]),
+            headers=headers,
+            proxies=self.session.proxies,
+        )
+        try:
+            titleRes = json.loads(r.content.decode())
+        except json.JSONDecodeError:
+            raise ValueError(f"Received Irrelevant Title API Response: {r.text}")
+
+        for correct in titleRes["resultObj"]["containers"]:
+            if int(correct["id"]) == int(self.m["id"]):
+                titleRes = correct.copy()
+
+        if (
+            titleRes["metadata"]["objectSubtype"] == "MOVIE_BUNDLE"
+            or titleRes["metadata"]["objectSubtype"] == "MOVIE"
+        ):
+            return Title(
+                id_=self.m["id"],
+                type_=Title.Types.MOVIE,
+                name=titleRes["metadata"]["title"],
+                year=titleRes["metadata"]["emfAttributes"]["release_year"]
+                if "release_year" in titleRes["metadata"]["emfAttributes"]
+                else titleRes["metadata"]["emfAttributes"]["release_date"].split("-")[
+                    0
+                ],
+                original_lang=titleRes["metadata"]["language"],
+                source=self.ALIASES[0],
+                service_data=titleRes,
             )
-            for track in tracks:
-                track.extra = mpd_url
+
+        elif titleRes["layout"] == "BUNDLE_ITEM":
+            bucket = []
+
+            if titleRes["metadata"]["objectSubtype"] == "EPISODIC_SHOW":
+                ep_count = titleRes["episodeCount"]
+                r = requests.get(
+                    url=self.config["endpoints"]["season"].format(
+                        id=titleRes["id"], ep_start=0, ep_end=ep_count - 1
+                    ),
+                    headers=headers,
+                    proxies=self.session.proxies,
+                )
+
+                try:
+                    seasonRes = json.loads(r.content.decode())
+                except json.JSONDecodeError:
+                    raise ValueError(
+                        f"Received Irrelevant Season API Response: {r.text}"
+                    )
+
+                for episode in seasonRes["resultObj"]["containers"][0]["containers"]:
+                    bucket.append(
+                        {
+                            "episode_id": episode["id"],
+                            "series_name": titleRes["metadata"]["title"],
+                            "season_number": titleRes["metadata"]["season"]
+                            if ("season" in titleRes["metadata"].keys())
+                            else "1",
+                            "episode_number": episode["metadata"]["episodeNumber"],
+                            "episode_name": episode["metadata"]["episodeTitle"],
+                            "episode_org_lang": episode["metadata"]["language"],
+                            "service_data": episode,
+                        }
+                    )
+
+            if titleRes["metadata"]["objectSubtype"] == "SHOW":
+                for season in titleRes["containers"]:
+                    if season["metadata"]["objectSubtype"] == "SEASON" and int(
+                        season["parents"][0]["parentId"]
+                    ) == int(self.m["id"]):
+                        ep_count = season["episodeCount"]
+                        r = requests.get(
+                            url=self.config["endpoints"]["season"].format(
+                                id=season["id"], ep_start=0, ep_end=ep_count - 1
+                            ),
+                            headers=headers,
+                            proxies=self.session.proxies,
+                        )
+                        try:
+                            seasonRes = json.loads(r.content.decode())
+                        except json.JSONDecodeError:
+                            raise ValueError(
+                                f"Received Irrelevant Season API Response: {r.text}"
+                            )
+
+                        for episode in seasonRes["resultObj"]["containers"][0][
+                            "containers"
+                        ]:
+                            bucket.append(
+                                {
+                                    "episode_id": episode["id"],
+                                    "series_name": titleRes["metadata"]["title"],
+                                    "season_number": season["metadata"]["season"],
+                                    "episode_number": episode["metadata"][
+                                        "episodeNumber"
+                                    ],
+                                    "episode_name": episode["metadata"]["episodeTitle"],
+                                    "episode_org_lang": episode["metadata"]["language"],
+                                    "service_data": episode,
+                                }
+                            )
+
+                    elif season["metadata"]["objectSubtype"] == "EPISODE_RANGE" and int(
+                        season["parents"][0]["parentId"]
+                    ) == int(self.m["id"]):
+                        ep_count = season["episodeCount"]
+                        r = requests.get(
+                            url=self.config["endpoints"]["season"].format(
+                                id=season["id"], ep_start=0, ep_end=ep_count - 1
+                            ),
+                            headers=headers,
+                            proxies=self.session.proxies,
+                        )
+
+                        try:
+                            seasonRes = json.loads(r.content.decode())
+                        except json.JSONDecodeError:
+                            raise ValueError(
+                                f"Received Irrelevant Season API Response: {r.text}"
+                            )
+
+                        for episode in seasonRes["resultObj"]["containers"][0][
+                            "containers"
+                        ]:
+                            bucket.append(
+                                {
+                                    "episode_id": episode["id"],
+                                    "series_name": titleRes["metadata"]["title"],
+                                    "season_number": season["metadata"]["season"],
+                                    "episode_number": episode["metadata"][
+                                        "episodeNumber"
+                                    ],
+                                    "episode_name": episode["metadata"]["episodeTitle"],
+                                    "episode_org_lang": episode["metadata"]["language"],
+                                    "service_data": episode,
+                                }
+                            )
+
+            if not bucket == []:
+                return [
+                    Title(
+                        id_=b["episode_id"],
+                        type_=Title.Types.TV,
+                        name=b["series_name"],
+                        season=b["season_number"],
+                        episode=b["episode_number"],
+                        episode_name=b["episode_name"],
+                        original_lang=b["episode_org_lang"],
+                        source=self.ALIASES[0],
+                        service_data=b["service_data"],
+                    )
+                    for b in bucket
+                ]
         else:
+            self.log.exit(" - Title unsupported.")
+
+    def get_tracks(self, title):
+        hdr_map = {
+            "DV": "DOLBY_VISION",
+            "HDR10": "HDR10",
+            "SDR": "HLG",
+        }
+
+        td_client_hints = None
+        if self.vcodec == "H265":
+            td_client_hints = {
+                "device_make": "Amazon",
+                "device_model": "AFTMM",
+                "display_res": "2160",
+                "viewport_res": "2160",
+                "supp_codec": "HEVC,H264,AAC,EAC3,AC3,ATMOS",
+                "audio_decoder": "EAC3,AAC,AC3,ATMOS",
+                "hdr_decoder": hdr_map.get(self.range, "HLG"),
+                "td_user_useragent": self.android_user_agent,
+            }
+
+        headers = self._android_headers()
+        if td_client_hints:
+            headers["Td_client_hints"] = json.dumps(
+                td_client_hints, separators=(",", ":")
+            )
+
+        if str(title.type) == "Types.MOVIE":
+            if "containers" not in title.service_data.keys():
+                _id_ = title.service_data["metadata"]["contentId"]
+            else:
+                for mov in title.service_data["containers"]:
+                    if mov["metadata"]["contentSubtype"] == "MOVIE":
+                        _id_ = mov["id"]
+        else:
+            _id_ = title.service_data["metadata"]["contentId"]
+
+        r = requests.get(
+            url=self.config["endpoints"]["manifest"].format(id=_id_),
+            headers=headers,
+            proxies=self.session.proxies,
+        )
+        try:
+            manifestRes = json.loads(r.content.decode())
+            self.log.debug(f"\n{json.dumps(manifestRes, indent=4)}")
+            if manifestRes.get("resultCode") == "KO":
+                error_code = manifestRes.get("errorDescription")
+                message = manifestRes.get("message", "Unknown error")
+                if error_code == "ACN_2411":
+                    limit = (manifestRes.get("resultObj") or {}).get(
+                        "MaxAllowedConcurrencyLimit"
+                    )
+                    self.log.exit(
+                        f" - Concurrent stream limit reached. Max allowed: {limit}"
+                    )
+                self.log.exit(f" - {message}")
+        except json.JSONDecodeError:
+            raise ValueError(f"Received Irrelevant Manifest API Response: {r.text}")
+
+        video_result = manifestRes.get("resultObj") or {}
+        mpd_url = video_result.get("videoURL")
+
+        if not mpd_url:
+            playback_items = video_result.get("playbackItems") or []
+            if playback_items and isinstance(playback_items[0], dict):
+                mpd_url = playback_items[0].get("url")
+
+        if not mpd_url:
+            self.log.exit(" - MPD URL not found in manifest response.")
+
+        browser_value = "ie" if self.playready else "chrome"
+        license_r = requests.post(
+            url=self.config["endpoints"]["license"],
+            headers=headers,
+            json={
+                "actionType": "play",
+                "assetId": str(_id_),
+                "browser": browser_value,
+                "deviceId": self.device_id,
+                "os": "android",
+                "platform": "web",
+            },
+            proxies=self.session.proxies,
+        )
+        try:
+            license_json = license_r.json()
+            if license_json.get("resultCode") == "KO":
+                self.log.warning(
+                    f" - License URL request failed: {license_json.get('errorDescription')} - "
+                    f"{license_json.get('message', 'Unknown error')}"
+                )
+            else:
+                license_result = license_json.get("resultObj") or {}
+                license_url = license_result.get("laURL")
+                license_token = license_result.get("token")
+                if license_url and license_token:
+                    self.license_api = f"{license_url}?ExpressPlayToken={license_token}"
+                elif license_url and "ExpressPlayToken" in license_url:
+                    self.license_api = license_url
+                elif license_url:
+                    self.log.warning(
+                        f" - License URL request returned no token: {license_url}"
+                    )
+                    self.license_api = license_url
+        except Exception:
+            pass
+
+        self.session.headers.update(
+            {
+                "User-Agent": self.web_user_agent,
+                "Accept": "*/*",
+                "Accept-Language": self.web_accept_language,
+                "Accept-Encoding": "gzip, deflate",
+                "Referer": "https://www.sonyliv.com/",
+                "X-Playback-Session-Id": f"{uuid.uuid4().hex}-{int(time.time() * 1000)}",
+                "Origin": "https://www.sonyliv.com",
+            }
+        )
+
+        r = self.session.get(mpd_url)
+
+        if ".m3u8" not in str(mpd_url):
             tracks = Tracks.from_mpd(
                 url=mpd_url,
+                data=r.content.decode(),
                 session=self.session,
-                source=self.ALIASES[0]
+                source=self.ALIASES[0],
+            )
+        else:
+            tracks = Tracks.from_m3u8(
+                m3u8.loads(str(r.content.decode())),
+                source=self.ALIASES[0],
             )
 
-        if self.vcodec == 'H264' and res["resultObj"]["Maximum_Resolution"] == "UHD":
-            self.log.info(" + Checking for UHD...")
-            client = {
-                '{"os_name":"Android",'
-                f'"os_version":{self.config["device"]["os_version"]},'
-                f'"device_make":{self.config["device"]["brand"]},'
-                f'"device_model":{self.config["device"]["device_model"]},'
-                f'"display_res":{self.config["device"]["device_res"]},'
-                f'"viewport_res":{self.config["device"]["device_res"]},'
-                f'"supp_codec":"H265,H264,AAC,EAC3,AC3,ATMOS",'
-                f'"audio_decoder":{self.config["device"]["audio_decoder"]},'
-                f'"hdr_decoder":"HLG",'
-                f'"app_version":{self.config["device"]["app_version"]},'
-                f'"td_user_useragent":{self.config["device"]["td_user_agent"]},'
-                f'"ram":{self.config["device"]["ram"]},'
-                f'"device_type":{self.config["device"]["device_type"]},'
-                f'"is_low_end_device":false,'
-                f'"conn_type":{self.config["device"]["conn_type"]},'
-                f'"client_throughput":{self.config["device"]["client_throughput"]}}'
-            }
-            res = self.get_manifest(title.id, client)
+        for video in tracks.videos:
+            video.hdr10 = False
+            video.dv = False
+            video.hlg = False
 
-            audio_mpd_url = res["resultObj"]["videoURL"]
-            self.log.info(audio_mpd_url)
+        av_range_ = (video_result.get("additionalDataJson") or {}).get(
+            "video_quality", ""
+        )
+        if av_range_ == "HDR":
+            for video in tracks.videos:
+                video.hdr10 = True
+        elif av_range_ == "DOLBY_VISION":
+            for video in tracks.videos:
+                video.dv = True
+        elif av_range_ == "HLG":
+            for video in tracks.videos:
+                video.hlg = True
 
-            audio_tracks = Tracks.from_mpd(
-                url=audio_mpd_url,
-                session=self.session,
-                source=self.ALIASES[0]
+        # Adding subtitle tracks
+        for sub in video_result.get("subtitle") or []:
+            tracks.add(
+                TextTrack(
+                    id_=sub["subtitleId"],
+                    source=self.ALIASES[0],
+                    url=sub["subtitleUrl"],
+                    codec="vtt",
+                    language=sub["subtitleLanguageName"],
+                ),
+                warn_only=True,
             )
-            tracks.audios = audio_tracks.audios
 
-        #"""
-        if res["resultObj"]["subtitle"]:
-            #self.log.info(res["resultObj"]["subtitle"])
-            for x in res["resultObj"]["subtitle"]:
-                sub_url = x["subtitleUrl"]
-                response = requests.get(sub_url)
-                if response.status_code == 200:
-                    tracks.add(
-                        TextTrack(
-                            id_=md5(sub_url.encode()).hexdigest()[0:6],
-                            source=self.ALIASES[0],
-                            url=sub_url,
-                            codec='vtt',
-                            language=x["subtitleLanguageName"],
-                            forced=False,
-                            sdh=False
-                        )
-                    )
-        #"""
-
-        if self.license_api:
-            for track in tracks:
-                track.license_url = self.license_api
-
-        if self.range == 'HDR10' and "hdr" in mpd_url:
-            for track in tracks.videos:
-                if not track.hdr10:
-                    track.hdr10 = True
-
-        # Store manifest URL for N_m3u8DL-RE
-        from vinetrimmer.utils.n_m3u8dl_config import store_manifest_url
-        store_manifest_url(tracks, mpd_url, self.ALIASES[0])
+        # PlayReady: extract keys using pypr before returning tracks
+        if self.playready and self.license_api:
+            self._extract_playready_keys(r.content.decode(), tracks)
 
         for track in tracks:
             track.needs_proxy = True
-
         return tracks
-
 
     def get_chapters(self, title):
         return []
 
-
     def certificate(self, **_):
-        return None  # will use common privacy cert
+        return None
 
+    def _find_prd_device(self):
+        cdm_name = (
+            config.cdm.get("Sonyliv")
+            or config.cdm.get("sonyliv")
+            or config.cdm.get("default")
+        )
+        if not cdm_name:
+            self.log.exit(" - No CDM device configured")
 
-    def license(self, challenge, track, **_):
+        device_dir = Path(directories.devices)
+
+        prd_path = device_dir / f"{cdm_name}.prd"
+        if prd_path.exists():
+            return Device.load(prd_path)
+
+        cdm_dir = device_dir / cdm_name
+        if cdm_dir.is_dir():
+            prd_files = list(cdm_dir.glob("*.prd"))
+            if prd_files:
+                return Device.load(max(prd_files, key=lambda x: x.stat().st_mtime))
+
+        prd_files = list(device_dir.glob("**/*.prd"))
+        if prd_files:
+            return Device.load(max(prd_files, key=lambda x: x.stat().st_mtime))
+
+        self.log.exit(" - No PlayReady .prd device file found")
+
+    def _get_playready_keys(self, kid_hex):
+        """
+        Use pypr to get PlayReady content keys for a given KID.
+        Generates PSSH from KID (original PSSH often fails for playready), creates
+        a challenge via pypr CDM, sends to the license server, and
+        returns a list of (kid_hex, key_hex) tuples.
+        """
+        # Build PlayReady header from KID
+        normalized_kid = kid_hex.replace("-", "").strip()
+        header = PlayReadyHeaderBuilder(normalized_kid).build_header(
+            version="4.0",
+            header_spec=None,
+            encryption_scheme="cenc",
+            key_specs=[(normalized_kid, normalized_kid)],
+        )
+        playready_header = base64.b64encode(header).decode("ascii")
+
+        device = self._find_prd_device()
+        cdm = Cdm.from_device(device)
+        session_id = cdm.open()
+
+        try:
+            pssh = PSSH(playready_header)
+            challenge = cdm.get_license_challenge(session_id, pssh.wrm_headers[0])
+
+            if isinstance(challenge, bytes):
+                challenge = challenge.decode("utf-8")
+
+            response = requests.post(
+                url=self.license_api,
+                headers={
+                    "accept": "*/*",
+                    "origin": "https://www.sonyliv.com",
+                    "referer": "https://www.sonyliv.com/",
+                    "soapaction": '"http://schemas.microsoft.com/DRM/2007/03/protocols/AcquireLicense"',
+                    "user-agent": self.web_user_agent,
+                },
+                data=challenge,
+                timeout=30,
+            )
+            response.raise_for_status()
+
+            response_text = response.text
+            if not response_text:
+                response_text = response.content.decode("utf-8", errors="replace")
+
+            cdm.parse_license(session_id, response_text)
+            keys = []
+            for key in cdm.get_keys(session_id):
+                keys.append((key.key_id.hex, key.key.hex()))
+            return keys
+        finally:
+            cdm.close(session_id)
+
+    def _extract_playready_keys(self, mpd_content, tracks):
+        """
+        Get KIDs from the mpd, get PR content keys via pypr,
+        and pre set track.key so dl.py skips its CDM pipeline (we want to decrypt using pypr)
+        """
+        content_keys = {}
+        try:
+            root = ET.fromstring(mpd_content)
+        except ET.ParseError:
+            self.log.warning(" - Failed to parse MPD XML for PlayReady KID extraction")
+            return
+
+        kids = set()
+        for cp in root.iter():
+            kid = cp.attrib.get("{urn:mpeg:cenc:2013}default_KID")
+            if kid:
+                kids.add(kid.replace("-", "").lower())
+
+        if not kids:
+            self.log.warning(" - No KIDs found in MPD for PlayReady")
+            return
+
+        self.log.info(f" + Found {len(kids)} KID(s) in MPD for PlayReady")
+
+        for kid in kids:
+            try:
+                keys = self._get_playready_keys(kid)
+                for key_kid, key_value in keys:
+                    normalized = key_kid.replace("-", "").lower()
+                    content_keys[normalized] = key_value
+                    self.log.info(f" + KEY: {normalized}:{key_value}")
+            except Exception as e:
+                self.log.warning(
+                    f" - PlayReady key extraction failed for KID {kid}: {e}"
+                )
+
+        # set keys on all encrypted tracks so dl.py skips CDM.
+        if content_keys:
+            key_value = next(iter(content_keys.values()))
+            for track in tracks:
+                if hasattr(track, "encrypted") and track.encrypted:
+                    track.key = key_value
+
+    def license(self, challenge: bytes, title: Title, **kwargs):
+        if not self.license_api:
+            r = requests.post(
+                url=self.config["endpoints"]["license"],
+                headers=self._android_headers(),
+                json={
+                    "actionType": "play",
+                    "assetId": str(title.service_data["metadata"]["contentId"]),
+                    "browser": "ie" if self.playready else "chrome",
+                    "deviceId": self.device_id,
+                    "os": "android",
+                    "platform": "web",
+                },
+            )
+            try:
+                lic_res = r.json()
+            except Exception:
+                lic_res = {}
+
+            license_result = lic_res.get("resultObj") or {}
+            license_url = license_result.get("laURL")
+            license_token = license_result.get("token")
+            if license_url and license_token:
+                self.license_api = f"{license_url}?ExpressPlayToken={license_token}"
+            elif license_url:
+                self.license_api = license_url
+            else:
+                self.log.exit(" - Unable to obtain license URL.")
+
         return requests.post(
-            url=track.license_url,
-            data=challenge,  # expects bytes
-            headers={
-                "Accept-Encoding": "gzip",
-                "Content-Type": "application/octet-stream",
-                "Host": "wv-sony.service.expressplay.com",
-                "User-Agent": self.config["device"]["user_agent"],
-                'x-playback-session-id': self.device_id,
-            }
+            url=self.license_api,
+            data=challenge,
         ).content
 
-    # Service specific functions
-
     def configure(self):
-        self.log.info("Logging into SonyLiv")
-        self.device_id = self.get_device_id()
-        self.log.info(f" + Using Device ID: {self.device_id}")
-        self.session_id = f'{str(uuid.uuid4().hex)}'
-        self.state_code, self.city, self.channelpartnerid = self.get_ULD()
-        self.token = self.get_token()
-        self.contact_id = self.get_contact_id()
-
-    #
-    def get_ULD(self):
-        headers = {
-            "Accept-Encoding": "gzip",
-            "app_version": self.config["device"]["app_version"],
-            "build_number": self.config["device"]["build_number"],
-            "Connection": "Keep-Alive",
-            "Content-Type": "application/json",
-            "device_id": self.device_id,
-            "session_id": self.session_id,
-            "user-agent": self.config["device"]["user_agent"],
-            "x-via-device": "true"
-        }
-        # Step 1: Make request
-        res = self.session.get(self.config["endpoints"]["uld_url"], headers=headers)
-        data = res.json()
-        # Step 2: Extract values safely
-        result = data.get("resultObj", {})
-        state_code = res.headers.get("state_code")
-        city = res.headers.get("city")
-        channel_partner_id = result.get("channelPartnerID")
-        return state_code, city, channel_partner_id
-
-
-    def get_contact_id(self):
-        contact_id_url = self.config["endpoints"]["get_contact_id"].format(
-            state_code=self.state_code,
-            channelpartnerid=self.channelpartnerid
-        )
-        data = self.session.get(self.config["endpoints"]["get_contact_id"]
-            url=contact_id_url,
-            headers={
-                "Accept-Encoding": "gzip",
-                "Content-Type": "application/json",
-                "Connection": "Keep-Alive",
+        self.session.headers.update(
+            {
+                "User-Agent": self.android_user_agent,
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": self.web_accept_language,
                 "x-via-device": "true",
-                "Host": "apiv2.sonyliv.com",
-                "session-id": self.session_id,
-                "user-agent": self.config["device"]["user_agent"],
-                "build_number": self.config["device"]["build_number"],
-                "app_version": self.config["device"]["app_version"],
-                "Authorization": self.token,
-                "device_id": self.device_id,
+                "Origin": "https://www.sonyliv.com",
+                "Referer": "https://www.sonyliv.com/",
             }
-        ).json()
-        return data['resultObj']['contactMessage'][0].get('contactID')
+        )
+        self.prepToken()
 
+    def prepToken(self):
+        cache_path = self.get_cache(
+            "{profile}_tokens.json".format(profile=self.profile)
+        )
 
-    def get_device_id(self):
-        to = self.get_cache("deviceid_{profile}.json".format(profile=self.profile))
-        if os.path.isfile(to):
-            with open(to, encoding="utf-8") as fd:
-                device_id = json.load(fd)
-                return device_id['deviceid']
-        unique_id = uuid.uuid4().hex[:16]
-        data = {"deviceid": unique_id}
-        os.makedirs(os.path.dirname(to), exist_ok=True)
-        with open(to, "w", encoding="utf-8") as fd:
-            json.dump(data, fd)
-        return unique_id
+        if os.path.isfile(cache_path):
+            with open(cache_path, "r", encoding="utf-8") as f:
+                tokens = json.load(f)
+            self.accessToken = tokens["token"]
+            self.session_id = tokens["session_id"]
+            self.security_token = tokens["security_token"]
+            self.device_id = tokens["device_id"]
+            self.profile_id = tokens["profile_id"]
+            self.log.info(" + Loaded tokens from cache.")
+            return
 
+        # OTP + Android TV activation flow thanks to Hugov
+        self.log.info(" + No cached tokens found. Starting OTP login flow...")
 
-    def get_token(self):
-        token_cache_path = self.get_cache("token_{profile}.json".format(profile=self.profile))
-        if os.path.isfile(token_cache_path):
-            with open(token_cache_path, encoding="utf-8") as fd:
-                token = json.load(fd)
-            if True:
-                # not expired, lets use
-                self.log.info(" + Using cached auth tokens...")
-                return token["access_token"]
-        # get new token
-        token = self.login()
-        return self.save_token(token, token_cache_path)
+        raw_mobile_number = input("Mobile number: ").strip()
+        mobile_number = re.sub(r"\D+", "", raw_mobile_number or "")
 
+        if not mobile_number or len(mobile_number) < 8:
+            raise self.log.exit(" - Invalid mobile number.")
 
-    @staticmethod
-    def save_token(token, to):
-        os.makedirs(os.path.dirname(to), exist_ok=True)
-        with open(to, "w", encoding="utf-8") as fd:
-            json.dump({'access_token': token}, fd)
-        return token
+        web_device_id = f"{secrets.token_hex(16)}-{int(time.time() * 1000)}"
+        web_session_id = f"{secrets.token_hex(16)}-{int(time.time() * 1000)}"
+        web_ga_user_id = (
+            f"GA1.2.{random.randint(100000000, 9999999999)}"
+            f".{random.randint(1500000000, 1999999999)}"
+        )
 
+        web_session = requests.Session()
+        android_session = requests.Session()
 
-    def login(self):
-        headers = {
-            "Accept-Encoding": "gzip",
-            "app_version": self.config["device"]["app_version"],
-            "build_number": self.config["device"]["build_number"],
-            "Connection": "Keep-Alive",
+        web_headers = {
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-ch-ua": self.web_sec_ch_ua,
+            "sec-ch-ua-mobile": "?0",
+            "session_id": web_session_id,
+            "User-Agent": self.web_user_agent,
+            "Accept": "application/json, text/plain, */*",
             "Content-Type": "application/json",
-            "device_id": self.device_id,
-            "session_id": self.session_id,
-            "user-agent": self.config["device"]["user_agent"],
+            "device_id": web_device_id,
             "x-via-device": "true",
+            "Origin": "https://www.sonyliv.com",
+            "Referer": "https://www.sonyliv.com/",
+            "Accept-Language": self.web_accept_language,
         }
-        payload = {
-            "channelPartnerID": self.channelpartnerid,
-            "deviceBrand": self.config["device"]["brand"],
-            "deviceModelNumber": self.config["device"]["model_number"],
-            "deviceName": self.config["device"]["device_name"],
-            "deviceType": self.config["device"]["device_type"],
-            "location": self.city,
-            "reset": True,
-            "serialNo": self.device_id
+
+        try:
+            web_session.get(
+                "https://www.sonyliv.com/",
+                headers={
+                    "User-Agent": self.web_user_agent,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": self.web_accept_language,
+                },
+                timeout=30,
+            )
+        except Exception:
+            pass
+
+        try:
+            web_session.get(
+                "https://bootstrap-prod.sonyliv.com/AGL/1.0/WEB/ULD",
+                headers={
+                    "User-Agent": self.web_user_agent,
+                    "Accept": "application/json, text/plain, */*",
+                    "Origin": "https://www.sonyliv.com",
+                    "Referer": "https://www.sonyliv.com/",
+                    "Accept-Language": self.web_accept_language,
+                },
+                timeout=30,
+            )
+        except Exception:
+            pass
+
+        self.log.info(" + Sending OTP...")
+
+        otp_url = "https://apiv2.sonyliv.com/AGL/1.6/A/ENG/WEB/IN/BR/CREATEOTP-V2"
+
+        create_otp_r = web_session.post(
+            otp_url,
+            headers=web_headers,
+            json={
+                "mobileNumber": mobile_number,
+                "channelPartnerID": "MSMIND",
+                "country": "IN",
+                "timestamp": datetime.now(timezone.utc)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z"),
+                "otpSize": 4,
+                "loginType": "REGISTERORSIGNIN",
+                "isMobileMandatory": True,
+            },
+            timeout=30,
+        )
+
+        try:
+            create_otp_data = create_otp_r.json()
+        except Exception:
+            create_otp_data = {}
+
+        if not create_otp_r.ok:
+            raise self.log.exit(
+                f" - OTP request failed: HTTP {create_otp_r.status_code}"
+            )
+
+        if (
+            create_otp_data.get("resultCode")
+            and create_otp_data.get("resultCode") != "OK"
+        ):
+            raise self.log.exit(
+                f" - OTP request failed: {json.dumps(create_otp_data)[:300]}"
+            )
+
+        create_result_obj = create_otp_data.get("resultObj") or {}
+        masked_mobile = create_result_obj.get("maskedMobileNumber") or mobile_number
+        otp_delivery = create_result_obj.get("otpOn") or "SMS"
+
+        self.log.info(f" + OTP sent via {otp_delivery} to {masked_mobile}")
+
+        otp_code = ""
+        while True:
+            input_queue: queue.Queue = queue.Queue()
+            thread = threading.Thread(
+                target=lambda q: q.put(input("OTP code: ").strip()),
+                args=(input_queue,),
+                daemon=True,
+            )
+            thread.start()
+
+            try:
+                raw_otp = input_queue.get(timeout=60)
+            except queue.Empty:
+                self.log.info(" + OTP entry timed out. Resending OTP...")
+                try:
+                    web_session.post(
+                        otp_url,
+                        headers=web_headers,
+                        json={
+                            "mobileNumber": mobile_number,
+                            "channelPartnerID": "MSMIND",
+                            "country": "IN",
+                            "timestamp": datetime.now(timezone.utc)
+                            .isoformat(timespec="milliseconds")
+                            .replace("+00:00", "Z"),
+                            "otpSize": 4,
+                            "loginType": "REGISTERORSIGNIN",
+                            "isMobileMandatory": True,
+                            "smsType": "SMS",
+                        },
+                        timeout=30,
+                    )
+                    self.log.info(" + OTP resent.")
+                except Exception:
+                    pass
+                continue
+
+            otp_code = re.sub(r"\D+", "", raw_otp or "")
+            if not otp_code:
+                self.log.warning(" - Empty OTP entered. Please try again.")
+                continue
+            break
+
+        self.log.info(" + Verifying OTP...")
+
+        confirm_r = web_session.post(
+            "https://apiv2.sonyliv.com/AGL/2.4/A/ENG/WEB/IN/BR/CONFIRMOTP-V2",
+            headers=web_headers,
+            json={
+                "channelPartnerID": "MSMIND",
+                "mobileNumber": mobile_number,
+                "country": "IN",
+                "otp": otp_code,
+                "dmaId": "IN",
+                "ageConfirmation": True,
+                "timestamp": datetime.now(timezone.utc)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z"),
+                "isMobileMandatory": True,
+                "deviceDetails": {
+                    "deviceName": "NA",
+                    "deviceType": "webClient",
+                    "gaUserId": web_ga_user_id,
+                    "modelNo": "Edge  Browser",
+                    "serialNo": web_device_id,
+                },
+                "address": {"state": "BR"},
+            },
+            timeout=30,
+        )
+
+        try:
+            confirm_data = confirm_r.json()
+        except Exception:
+            confirm_data = {}
+
+        if not confirm_r.ok:
+            raise self.log.exit(
+                f" - OTP verification failed: HTTP {confirm_r.status_code}"
+            )
+
+        if confirm_data.get("resultCode") and confirm_data.get("resultCode") != "OK":
+            raise self.log.exit(
+                f" - OTP verification failed: {json.dumps(confirm_data)[:300]}"
+            )
+
+        confirm_result_obj = confirm_data.get("resultObj") or {}
+        web_auth_token = confirm_result_obj.get("accessToken") or ""
+
+        if not web_auth_token:
+            raise self.log.exit(" - Web access token not found in OTP response.")
+
+        self.log.info(" + OTP verified. Fetching web profile...")
+
+        try:
+            web_profile_r = web_session.get(
+                "https://apiv2.sonyliv.com/AGL/2.9/A/ENG/WEB/IN/BR/GETPROFILE?channelPartnerID=MSMIND",
+                headers={**web_headers, "Authorization": web_auth_token},
+                timeout=30,
+            )
+            if web_profile_r.ok:
+                web_profile_result = web_profile_r.json().get("resultObj") or {}
+                web_auth_token = web_profile_result.get("accessToken") or web_auth_token
+        except Exception:
+            pass
+
+        self.log.info(" + Starting Android TV device activation...")
+
+        android_session_id = uuid.uuid4().hex
+        android_device_id = uuid.uuid4().hex[:16]
+
+        tv_headers = {
+            "Content-Type": "application/json",
+            "x-via-device": "true",
+            "Host": "apiv2.sonyliv.com",
+            "session-id": android_session_id,
+            "user-agent": self.android_user_agent,
+            "build_number": self.android_build_number,
+            "app_version": self.android_app_version,
+            "device_id": android_device_id,
         }
-        res = self.session.post(url=self.config["endpoints"]["generate_device_code"].format(state_code=self.state_code), headers=headers, json=payload).json()
-        code = res['resultObj']['activationCode']
-        total_attempts = 300
-        interval = 1  # seconds
+
+        sec_r = android_session.get(
+            "https://apiv2.sonyliv.com/AGL/1.5/A/ENG/FIRE_TV/IN/GETTOKEN",
+            headers={"Host": "apiv2.sonyliv.com", "user-agent": "okhttp/3.14.9"},
+            timeout=30,
+        )
+
+        try:
+            sec_data = sec_r.json()
+        except Exception:
+            sec_data = {}
+
+        if not sec_r.ok:
+            raise self.log.exit(
+                f" - Security token request failed: HTTP {sec_r.status_code}"
+            )
+
+        security_token = sec_data.get("resultObj") or ""
+        if not security_token:
+            raise self.log.exit(" - Security token missing from response.")
+
+        tv_headers["security_token"] = security_token
+
+        # Get ULD (user location data)
+        uld_r = android_session.get(
+            "https://apiv2.sonyliv.com/AGL/1.5/A/ENG/FIRE_TV/IN/USER/ULD",
+            headers=tv_headers,
+            timeout=30,
+        )
+
+        try:
+            uld_data = uld_r.json()
+        except Exception:
+            uld_data = {}
+
+        if not uld_r.ok:
+            raise self.log.exit(f" - ULD request failed: HTTP {uld_r.status_code}")
+
+        uld_result = uld_data.get("resultObj") or {}
+        state_code = uld_result.get("state_code") or "BR"
+        city = uld_result.get("city") or "NA"
+        channelpartnerid = uld_result.get("channelPartnerID") or "MSMIND"
+
+        activation_payload = {
+            "channelPartnerID": channelpartnerid,
+            "deviceBrand": "Amazon",
+            "deviceModelNumber": "AmazonAFTMM",
+            "deviceName": "Fire TV Sony Liv",
+            "deviceType": "FireTV",
+            "location": city,
+            "serialNo": android_device_id,
+        }
+
+        # Generate device activation code
+        act_code_r = android_session.post(
+            "https://apiv2.sonyliv.com/AGL/1.5/A/ENG/FIRE_TV/IN/GENERATEDEVICEACTIVATIONCODE",
+            headers=tv_headers,
+            json=activation_payload,
+            timeout=30,
+        )
+
+        try:
+            act_code_data = act_code_r.json()
+        except Exception:
+            act_code_data = {}
+
+        if not act_code_r.ok:
+            raise self.log.exit(
+                f" - Activation code request failed: HTTP {act_code_r.status_code}"
+            )
+
+        act_code_result = act_code_data.get("resultObj") or {}
+        activation_code = act_code_result.get("activationCode") or ""
+
+        if not activation_code:
+            raise self.log.exit(
+                f" - Activation code missing: {json.dumps(act_code_data)[:300]}"
+            )
 
         self.log.info(
-            f"LOGIN_REQUIRED|{self.config['endpoints']['activate_url']}|{code}|{total_attempts * interval}"
+            f" + Activation code: {activation_code}. Registering TV device with web account..."
         )
 
-        # ✅ polling loop (USE CORRECT API HERE)
-        for i in range(total_attempts):
-            try:
-                r = self.session.post(
-                    url=self.config["endpoints"]["verify_code"].format(state_code=self.state_code),
-                    headers = {
-                        "Accept-Encoding": "gzip",
-                        "app_version": self.config["device"]["app_version"],
-                        "build_number": self.config["device"]["build_number"],
-                        "Connection": "Keep-Alive",
-                        "Content-Type": "application/json",
-                        "device_id": self.device_id,
-                        "session_id": self.session_id,
-                        "user-agent": self.config["device"]["user_agent"],
-                        "x-via-device": "true",
-                    },
-                    json={
-                        "channelPartnerID": self.channelpartnerid,
-                        "deviceBrand": self.config["device"]["brand"],
-                        "deviceModelNumber": self.config["device"]["model_number"],
-                        "deviceName": self.config["device"]["device_name"],
-                        "deviceType": self.config["device"]["device_type"],
-                        "location": self.city,
-                        "reset": False,
-                        "serialNo": self.device_id
-                    }
-                ).json()
+        # Register device using web token + activation code
+        reg_r = web_session.post(
+            "https://apiv2.sonyliv.com/AGL/1.6/SR/ENG/WEB/IN/REGISTERDEVICE",
+            headers={**web_headers, "Authorization": web_auth_token},
+            json={
+                "channelPartnerID": "MSMIND",
+                "activationCode": activation_code,
+                "activationtype": "activationcode",
+            },
+            timeout=30,
+        )
 
-                result = r.get("resultObj", {})
+        try:
+            reg_data = reg_r.json()
+        except Exception:
+            reg_data = {}
 
-                # ✅ SUCCESS
-                if "accessToken" in result:
-                    self.log.info("LOGIN_SUCCESS")
-                    return result["accessToken"]
+        if not reg_r.ok:
+            raise self.log.exit(
+                f" - Device registration failed: HTTP {reg_r.status_code}"
+            )
 
-            except Exception as e:
-                self.log.info(f"LOGIN_TIMEOUT|{str(e)}")
+        if reg_data.get("resultCode") and reg_data.get("resultCode") != "OK":
+            raise self.log.exit(
+                f" - Device registration failed: {json.dumps(reg_data)[:300]}"
+            )
 
-            time.sleep(interval)
+        self.log.info(" + TV device registered. Generating Android TV access token...")
 
-        # ⛔ TIMEOUT
-        self.log.info("LOGIN_TIMEOUT")
-        return None
+        # call GENERATEDEVICEACTIVATIONCODE again to get accessToken
+        token_r = android_session.post(
+            "https://apiv2.sonyliv.com/AGL/1.5/A/ENG/FIRE_TV/IN/GENERATEDEVICEACTIVATIONCODE",
+            headers=tv_headers,
+            json=activation_payload,
+            timeout=30,
+        )
+
+        try:
+            token_data = token_r.json()
+        except Exception:
+            token_data = {}
+
+        if not token_r.ok:
+            raise self.log.exit(
+                f" - Android TV token request failed: HTTP {token_r.status_code}"
+            )
+
+        token_result = token_data.get("resultObj") or {}
+        token = token_result.get("accessToken") or ""
+
+        if not token:
+            raise self.log.exit(
+                f" - Android TV access token missing: {json.dumps(token_data)[:300]}"
+            )
+
+        self.log.info(" + Got Android TV access token. Fetching TV profile...")
+
+        profile_r = android_session.get(
+            f"https://apiv2.sonyliv.com/AGL/3.3/A/ENG/FIRE_TV/IN/{state_code}/GETPROFILE"
+            f"?channelPartnerID={channelpartnerid}",
+            headers={**tv_headers, "Authorization": token},
+            timeout=30,
+        )
+
+        try:
+            profile_data = profile_r.json()
+        except Exception:
+            profile_data = {}
+
+        if not profile_r.ok:
+            raise self.log.exit(
+                f" - TV profile request failed: HTTP {profile_r.status_code}"
+            )
+
+        profile_result = profile_data.get("resultObj") or {}
+        contact_messages = profile_result.get("contactMessage") or []
+        contact_id = ""
+
+        if contact_messages and isinstance(contact_messages[0], dict):
+            contact_id = str(contact_messages[0].get("contactID") or "")
+
+        if not contact_id:
+            raise self.log.exit(
+                " - Profile contact ID missing from TV profile response."
+            )
+
+        tokens_to_save = {
+            "token": token,
+            "session_id": android_session_id,
+            "security_token": security_token,
+            "device_id": android_device_id,
+            "profile_id": contact_id,
+        }
+
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(tokens_to_save, f, indent=2)
+
+        self.accessToken = token
+        self.session_id = android_session_id
+        self.security_token = security_token
+        self.device_id = android_device_id
+        self.profile_id = contact_id
+
+        self.log.info(" + Authentication complete. Tokens saved to cache.")
