@@ -1,0 +1,37 @@
+endpoints:
+  login: https://eu1.tabii.com/apigateway/auth/v2/login
+  token_refresh: https://eu1.tabii.com/apigateway/auth/v2/token/refresh
+  profiles: https://eu1.tabii.com/apigateway/profiles/v2/
+  profile_token: https://eu1.tabii.com/apigateway/profiles/v2/{profile_sk}/token
+  metadata: https://eu1.tabii.com/apigateway/catalog/v1/show/{title_id}
+  entitlement_ticket: https://eu1.tabii.com/apigateway/entitlement/v1/ticket/{entitlement_id}
+  widevine_license: https://eu1.tabii.com/apigateway/drm/v1/wv
+  playback_manifest: https://eu1.tabii.com/apigateway/pbr/v1/media{media_url}
+
+client:
+  android:
+    user_agent: okhttp/4.10.0
+    license_user_agent: Dalvik/2.1.0 (Linux; U; Android 8.1.0; Android SDK built for x86 Build/OSM1.180201.037)
+    device_id: 870d28cdb151d195
+    headers:
+      Accept-Encoding: gzip
+      Accept-Language: en
+      Connection: Keep-Alive
+      Trtdigitalprod: 3cdaf5f04d9449e0b9c82b9a08f1bb1a
+      x-client-useragent: ANDROID APP Android SDK built for x86
+      x-clientid: ANDROID
+      x-clientpass: "000"
+      x-uid: 870d28cdb151d195
+      App-Bundle-Id: com.trt.tabii.android
+      App-Name: Tabii
+      App-Version: "94"
+      Device-Brand: google
+      Device-Country: TR
+      Device-Id: 870d28cdb151d195
+      Device-Language: en
+      Device-Model: sdk_phone_x86
+      Device-Name: Google sdk_phone_x86
+      Device-OS-Name: "11"
+      Device-OS-Version: "30"
+      Device-Type: AndroidPhone
+      Platform: AndroidPhone
